@@ -443,11 +443,7 @@ class Backend:
         This prevents the group body tasks from hanging indefinitely (#8786)
         """
 
-        # Extract original exception from ChordError if available
-        if isinstance(exc, ChordError) and hasattr(exc, '__cause__') and exc.__cause__:
-            original_exc = exc.__cause__
-        else:
-            original_exc = exc
+        original_exc = self._chord_original_exception(exc)
 
         try:
             # Freeze the group to get the actual GroupResult with task IDs
@@ -459,30 +455,9 @@ class Backend:
 
                 # Handle each task in the group individually
                 for result in frozen_group.results:
-                    try:
-                        # Create fake request for error callbacks
-                        fake_request = _create_fake_task_request(
-                            task_id=result.id,
-                            errbacks=group_callback.options.get("link_error", []),
-                            task_name=getattr(result, 'task', 'unknown')
-                        )
-
-                        # Call error callbacks for this task with original exception
-                        try:
-                            backend._call_task_errbacks(fake_request, original_exc, None)
-                        except Exception:  # pylint: disable=broad-except
-                            # continue on exception to be sure to iter to all the group tasks
-                            pass
-
-                        # Mark the individual task as failed with original exception
-                        backend.fail_from_current_stack(result.id, exc=original_exc)
-
-                    except Exception as task_exc:  # pylint: disable=broad-except
-                        # Log error but continue with other tasks
-                        logger.exception(
-                            'Failed to handle chord error for task %s: %r',
-                            getattr(result, 'id', 'unknown'), task_exc
-                        )
+                    self._handle_group_chord_error_for_task(
+                        result, group_callback, backend, original_exc,
+                    )
 
                 # Also mark the group itself as failed if it has an ID
                 frozen_group_id = getattr(frozen_group, 'id', None)
@@ -499,6 +474,41 @@ class Backend:
             )
             # Fallback to original error handling
             return backend.fail_from_current_stack(group_callback.id, exc=exc)
+
+    @staticmethod
+    def _chord_original_exception(exc):
+        """Extract the original exception wrapped inside a ChordError, if any."""
+        if isinstance(exc, ChordError) and getattr(exc, '__cause__', None):
+            return exc.__cause__
+        return exc
+
+    @staticmethod
+    def _handle_group_chord_error_for_task(result, group_callback, backend, original_exc):
+        """Fail a single group-body task and run its error callbacks."""
+        try:
+            # Create fake request for error callbacks
+            fake_request = _create_fake_task_request(
+                task_id=result.id,
+                errbacks=group_callback.options.get("link_error", []),
+                task_name=getattr(result, 'task', 'unknown')
+            )
+
+            # Call error callbacks for this task with original exception
+            try:
+                backend._call_task_errbacks(fake_request, original_exc, None)
+            except Exception:  # pylint: disable=broad-except
+                # continue on exception to be sure to iter to all the group tasks
+                pass
+
+            # Mark the individual task as failed with original exception
+            backend.fail_from_current_stack(result.id, exc=original_exc)
+
+        except Exception as task_exc:  # pylint: disable=broad-except
+            # Log error but continue with other tasks
+            logger.exception(
+                'Failed to handle chord error for task %s: %r',
+                getattr(result, 'id', 'unknown'), task_exc
+            )
 
     def fail_from_current_stack(self, task_id, exc=None):
         type_, real_exc, tb = sys.exc_info()
@@ -706,33 +716,33 @@ class Backend:
         if request and getattr(request, 'parent_id', None):
             meta['parent_id'] = request.parent_id
 
-        if self.app.conf.find_value_for_key('extended', 'result'):
-            if request:
-                request_meta = {
-                    'name': getattr(request, 'task', None),
-                    'args': getattr(request, 'args', None),
-                    'kwargs': getattr(request, 'kwargs', None),
-                    'worker': getattr(request, 'hostname', None),
-                    'retries': getattr(request, 'retries', None),
-                    'queue': request.delivery_info.get('routing_key')
-                    if hasattr(request, 'delivery_info') and
-                    request.delivery_info else None,
-                }
-                if getattr(request, 'stamps', None):
-                    request_meta['stamped_headers'] = request.stamped_headers
-                    request_meta.update(request.stamps)
-
-                if encode:
-                    # args and kwargs need to be encoded properly before saving
-                    encode_needed_fields = {"args", "kwargs"}
-                    for field in encode_needed_fields:
-                        value = request_meta[field]
-                        encoded_value = self.encode(value)
-                        request_meta[field] = ensure_bytes(encoded_value)
-
-                meta.update(request_meta)
+        extended = self.app.conf.find_value_for_key('extended', 'result')
+        if extended and request:
+            meta.update(self._extended_request_meta(request, encode))
 
         return meta
+
+    def _extended_request_meta(self, request, encode):
+        """Build the extended result metadata for a request."""
+        delivery_info = getattr(request, 'delivery_info', None)
+        request_meta = {
+            'name': getattr(request, 'task', None),
+            'args': getattr(request, 'args', None),
+            'kwargs': getattr(request, 'kwargs', None),
+            'worker': getattr(request, 'hostname', None),
+            'retries': getattr(request, 'retries', None),
+            'queue': delivery_info.get('routing_key') if delivery_info else None,
+        }
+        if getattr(request, 'stamps', None):
+            request_meta['stamped_headers'] = request.stamped_headers
+            request_meta.update(request.stamps)
+
+        if encode:
+            # args and kwargs need to be encoded properly before saving
+            for field in ("args", "kwargs"):
+                request_meta[field] = ensure_bytes(self.encode(request_meta[field]))
+
+        return request_meta
 
     def _sleep(self, amount):
         time.sleep(amount)
@@ -744,36 +754,39 @@ class Backend:
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
-                if self.always_retry and self.exception_safe_to_retry(exc):
-                    if retries < self.max_retries:
-                        retries += 1
-                        logger.warning(
-                            'Failed operation %s. Retrying %s more times.',
-                            getattr(func, '__name__', repr(func)), self.max_retries - retries,
-                            exc_info=True)
-                        try:
-                            self.on_backend_retryable_error(exc)
-                        except Exception:
-                            logger.exception(
-                                "on_backend_retryable_error hook failed; continuing retry loop",
-                            )
-
-                        # get_exponential_backoff_interval computes integers
-                        # and time.sleep accept floats for sub second sleep
-                        sleep_amount = get_exponential_backoff_interval(
-                            self.base_sleep_between_retries_ms, retries,
-                            self.max_sleep_between_retries_ms, True) / 1000
-                        self._sleep(sleep_amount)
-                    else:
-                        if fallback_exc:
-                            exc_kwargs = {}
-                            for key in ("task_id", "state"):
-                                if key in kwargs:
-                                    exc_kwargs[key] = kwargs[key]
-                            raise_with_context(fallback_exc(fallback_msg, **exc_kwargs))
-                        raise
-                else:
+                if not (self.always_retry and self.exception_safe_to_retry(exc)):
                     raise
+                if retries >= self.max_retries:
+                    self._raise_retry_exhausted(exc, fallback_exc, fallback_msg, kwargs)
+                retries += 1
+                self._backoff_before_retry(func, exc, retries)
+
+    def _raise_retry_exhausted(self, exc, fallback_exc, fallback_msg, kwargs):
+        """Raise the fallback exception (or re-raise) once retries are exhausted."""
+        if not fallback_exc:
+            raise exc
+        exc_kwargs = {key: kwargs[key] for key in ("task_id", "state") if key in kwargs}
+        raise_with_context(fallback_exc(fallback_msg, **exc_kwargs))
+
+    def _backoff_before_retry(self, func, exc, retries):
+        """Notify the retry hook and sleep with exponential backoff before retrying."""
+        logger.warning(
+            'Failed operation %s. Retrying %s more times.',
+            getattr(func, '__name__', repr(func)), self.max_retries - retries,
+            exc_info=True)
+        try:
+            self.on_backend_retryable_error(exc)
+        except Exception:
+            logger.exception(
+                "on_backend_retryable_error hook failed; continuing retry loop",
+            )
+
+        # get_exponential_backoff_interval computes integers
+        # and time.sleep accept floats for sub second sleep
+        sleep_amount = get_exponential_backoff_interval(
+            self.base_sleep_between_retries_ms, retries,
+            self.max_sleep_between_retries_ms, True) / 1000
+        self._sleep(sleep_amount)
 
     def store_result(self, task_id, result, state,
                      traceback=None, request=None, **kwargs):
