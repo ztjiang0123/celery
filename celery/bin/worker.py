@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections import namedtuple
 
 import click
 from click import ParamType
@@ -17,6 +18,10 @@ from celery.utils.log import get_logger
 from celery.utils.nodenames import default_nodename, host_format, node_format
 
 logger = get_logger(__name__)
+
+# Daemon-related worker options that flow straight through to ``detach``.
+_DetachOptions = namedtuple('_DetachOptions',
+                            ('logfile', 'pidfile', 'uid', 'gid', 'hostname'))
 
 
 class CeleryBeat(ParamType):
@@ -131,6 +136,49 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
             logger.critical("Can't exec %r", ' '.join([path] + argv),
                             exc_info=True)
             return EX_FAILURE
+
+
+def _apply_disable_prefetch_option(app, kwargs):
+    """Move the ``--disable-prefetch`` flag onto the app config if set."""
+    disable_prefetch = kwargs.get('disable_prefetch')
+    if disable_prefetch is not None:
+        app.conf.worker_disable_prefetch = kwargs.pop('disable_prefetch')
+
+
+def _apply_extra_cmdline_config(app, ctx):
+    """Parse any extra positional args as worker configuration overrides."""
+    if not ctx.args:
+        return
+    try:
+        app.config_from_cmdline(ctx.args, namespace='worker')
+    except (KeyError, ValueError) as e:
+        # TODO: Improve the error messages
+        raise click.UsageError(
+            "Unable to parse extra configuration from command line.\n"
+            f"Reason: {e}", ctx=ctx)
+
+
+def _detach_worker(app, kwargs, opts):
+    """Re-exec the worker as a detached (daemonized) process.
+
+    ``opts`` is a :class:`_DetachOptions` bundling the daemon-related options
+    that flow straight through to :func:`detach`.
+    """
+    argv = ['-m', 'celery'] + sys.argv[1:]
+    for flag in ('--detach', '-D', '--uid', '--gid'):
+        if flag in argv:
+            argv.remove(flag)
+
+    return detach(sys.executable,
+                  argv,
+                  logfile=opts.logfile,
+                  pidfile=opts.pidfile,
+                  uid=opts.uid, gid=opts.gid,
+                  umask=kwargs.get('umask', None),
+                  workdir=kwargs.get('workdir', None),
+                  app=app,
+                  executable=kwargs.get('executable', None),
+                  hostname=opts.hostname)
 
 
 @click.command(cls=CeleryDaemonCommand,
@@ -323,37 +371,13 @@ def worker(ctx, hostname=None, pool_cls=None, app=None, uid=None, gid=None,
     """
     try:
         app = ctx.obj.app
-        if 'disable_prefetch' in kwargs and kwargs['disable_prefetch'] is not None:
-            app.conf.worker_disable_prefetch = kwargs.pop('disable_prefetch')
-        if ctx.args:
-            try:
-                app.config_from_cmdline(ctx.args, namespace='worker')
-            except (KeyError, ValueError) as e:
-                # TODO: Improve the error messages
-                raise click.UsageError(
-                    "Unable to parse extra configuration from command line.\n"
-                    f"Reason: {e}", ctx=ctx)
+        _apply_disable_prefetch_option(app, kwargs)
+        _apply_extra_cmdline_config(app, ctx)
         if kwargs.get('detach', False):
-            argv = ['-m', 'celery'] + sys.argv[1:]
-            if '--detach' in argv:
-                argv.remove('--detach')
-            if '-D' in argv:
-                argv.remove('-D')
-            if "--uid" in argv:
-                argv.remove('--uid')
-            if "--gid" in argv:
-                argv.remove('--gid')
-
-            return detach(sys.executable,
-                          argv,
-                          logfile=logfile,
-                          pidfile=pidfile,
-                          uid=uid, gid=gid,
-                          umask=kwargs.get('umask', None),
-                          workdir=kwargs.get('workdir', None),
-                          app=app,
-                          executable=kwargs.get('executable', None),
-                          hostname=hostname)
+            return _detach_worker(app, kwargs, _DetachOptions(
+                logfile=logfile, pidfile=pidfile,
+                uid=uid, gid=gid, hostname=hostname,
+            ))
 
         maybe_drop_privileges(uid=uid, gid=gid)
         worker = app.Worker(
