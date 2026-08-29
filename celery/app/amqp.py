@@ -523,33 +523,41 @@ class AMQP:
         except AttributeError:
             return 'direct'
 
-    @staticmethod
-    def _resolve_exchange_routing(exchange, routing_key, exchange_type, qname,
-                                  queue, default_exchange, default_rkey):
-        """Resolve the exchange and routing key for the outgoing message."""
+    def _resolve_exchange_routing(self, exchange, routing_key, exchange_type,
+                                  resolved_queue):
+        """Resolve the exchange and routing key for the outgoing message.
+
+        ``resolved_queue`` is the ``(qname, queue)`` pair from
+        :meth:`_resolve_queue`.
+        """
+        qname, queue = resolved_queue
         # convert to anon-exchange, when exchange not set and direct ex.
         if (not exchange or not routing_key) and exchange_type == 'direct':
             return '', qname
         if exchange is None:
             # not topic exchange, and exchange not undefined
-            exchange = queue.exchange.name or default_exchange
-            routing_key = routing_key or queue.routing_key or default_rkey
+            exchange = queue.exchange.name or self.default_exchange
+            routing_key = (routing_key or queue.routing_key or
+                           self.app.conf.task_default_routing_key)
         return exchange, routing_key
 
     @staticmethod
-    def _publish_task_sent_event(sent_event, evd, producer, exchange, qname,
-                                 routing_key, retry, retry_policy):
-        """Emit the ``task-sent`` monitoring event for a published task."""
-        exname = exchange
+    def _publish_task_sent_event(sent_event, evd, producer, destination,
+                                 retry_options):
+        """Emit the ``task-sent`` monitoring event for a published task.
+
+        ``destination`` carries the ``exchange``/``queue``/``routing_key`` the
+        task was published to; ``retry_options`` the publish ``retry`` settings.
+        """
+        exname = destination['exchange']
         if isinstance(exname, Exchange):
             exname = exname.name
         sent_event.update({
-            'queue': qname,
+            'queue': destination['queue'],
             'exchange': exname,
-            'routing_key': routing_key,
+            'routing_key': destination['routing_key'],
         })
-        evd.publish('task-sent', sent_event,
-                    producer, retry=retry, retry_policy=retry_policy)
+        evd.publish('task-sent', sent_event, producer, **retry_options)
 
     @staticmethod
     def _emit_deprecated_task_sent(send_task_sent, name, body, headers):
@@ -582,9 +590,7 @@ class AMQP:
         sent_receivers = signals.task_sent.receivers   # XXX compat (remove 6.0)
 
         default_evd = self._event_dispatcher
-        default_exchange = self.default_exchange
 
-        default_rkey = self.app.conf.task_default_routing_key
         default_serializer = self.app.conf.task_serializer
         default_compressor = self.app.conf.task_compression
 
@@ -605,8 +611,7 @@ class AMQP:
                 delivery_mode, queue, default_delivery_mode)
             exchange_type = amqp._resolve_exchange_type(exchange_type, queue)
             exchange, routing_key = amqp._resolve_exchange_routing(
-                exchange, routing_key, exchange_type, qname, queue,
-                default_exchange, default_rkey)
+                exchange, routing_key, exchange_type, (qname, queue))
             if declare is None and queue and not isinstance(queue, Broadcast):
                 declare = [queue]
 
@@ -643,7 +648,9 @@ class AMQP:
             if sent_event:
                 amqp._publish_task_sent_event(
                     sent_event, event_dispatcher or default_evd, producer,
-                    exchange, qname, routing_key, retry, retry_policy)
+                    {'exchange': exchange, 'queue': qname,
+                     'routing_key': routing_key},
+                    {'retry': retry, 'retry_policy': retry_policy})
             return ret
         return send_task_message
 

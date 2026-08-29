@@ -966,9 +966,13 @@ class Celery:
                 options = dict(exec_option_defaults, **options)
         return task_type, options
 
-    def _publish_task_message(self, amqp, name, message, task_id, connection,
-                              producer, ignore_result, options):
-        """Publish a prepared task message, stripping stamped headers first."""
+    def _publish_task_message(self, prepared, connection, producer, options):
+        """Publish a prepared task message, stripping stamped headers first.
+
+        ``prepared`` carries the ``name``, ``message``, ``task_id`` and
+        ``ignore_result`` flag of the task being published.
+        """
+        amqp = self.amqp
         for stamp in options.pop('stamped_headers', []):
             options.pop(stamp)
 
@@ -977,9 +981,10 @@ class Celery:
 
         with self.producer_or_acquire(producer) as P:
             with P.connection._reraise_as_library_errors():
-                if not ignore_result:
-                    self.backend.on_task_call(P, task_id)
-                amqp.send_task_message(P, name, message, **options)
+                if not prepared['ignore_result']:
+                    self.backend.on_task_call(P, prepared['task_id'])
+                amqp.send_task_message(
+                    P, prepared['name'], prepared['message'], **options)
 
     def _resolve_parent_context(self, root_id, parent_id, options, conf):
         """Fill in ``root_id``/``parent_id`` and priority from the parent task.
@@ -1082,8 +1087,9 @@ class Celery:
         )
 
         self._publish_task_message(
-            amqp, name, message, task_id, connection, producer,
-            ignore_result, options)
+            {'name': name, 'message': message, 'task_id': task_id,
+             'ignore_result': ignore_result},
+            connection, producer, options)
 
         result = (result_cls or self.AsyncResult)(task_id)
         # We avoid using the constructor since a custom result class
