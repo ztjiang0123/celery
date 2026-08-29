@@ -1183,6 +1183,17 @@ class BaseKeyValueStoreBackend(Backend):
                 for i, v in self._filter_ready(enumerate(values), READY_STATES)
             }
 
+    def _get_cached_ready(self, ids, READY_STATES):
+        """Yield ``(task_id, meta)`` for ids already cached in a ready state."""
+        cache = self._cache
+        for task_id in ids:
+            try:
+                cached = cache[task_id]
+            except KeyError:
+                continue
+            if cached['status'] in READY_STATES:
+                yield task_id, cached
+
     def get_many(self, task_ids, timeout=None, interval=0.5, no_ack=True,
                  on_message=None, on_interval=None, max_iterations=None,
                  READY_STATES=states.READY_STATES):
@@ -1190,15 +1201,9 @@ class BaseKeyValueStoreBackend(Backend):
         ids = task_ids if isinstance(task_ids, set) else set(task_ids)
         cached_ids = set()
         cache = self._cache
-        for task_id in ids:
-            try:
-                cached = cache[task_id]
-            except KeyError:
-                pass
-            else:
-                if cached['status'] in READY_STATES:
-                    yield bytes_to_str(task_id), cached
-                    cached_ids.add(task_id)
+        for task_id, cached in self._get_cached_ready(ids, READY_STATES):
+            yield bytes_to_str(task_id), cached
+            cached_ids.add(task_id)
 
         ids.difference_update(cached_ids)
         iterations = 0
