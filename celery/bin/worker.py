@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections import namedtuple
 
 import click
 from click import ParamType
@@ -17,6 +18,10 @@ from celery.utils.log import get_logger
 from celery.utils.nodenames import default_nodename, host_format, node_format
 
 logger = get_logger(__name__)
+
+# Daemon-related worker options that flow straight through to ``detach``.
+_DetachOptions = namedtuple('_DetachOptions',
+                            ('logfile', 'pidfile', 'uid', 'gid', 'hostname'))
 
 
 class CeleryBeat(ParamType):
@@ -153,8 +158,12 @@ def _apply_extra_cmdline_config(app, ctx):
             f"Reason: {e}", ctx=ctx)
 
 
-def _detach_worker(app, kwargs, *, logfile, pidfile, uid, gid, hostname):
-    """Re-exec the worker as a detached (daemonized) process."""
+def _detach_worker(app, kwargs, opts):
+    """Re-exec the worker as a detached (daemonized) process.
+
+    ``opts`` is a :class:`_DetachOptions` bundling the daemon-related options
+    that flow straight through to :func:`detach`.
+    """
     argv = ['-m', 'celery'] + sys.argv[1:]
     for flag in ('--detach', '-D', '--uid', '--gid'):
         if flag in argv:
@@ -162,14 +171,14 @@ def _detach_worker(app, kwargs, *, logfile, pidfile, uid, gid, hostname):
 
     return detach(sys.executable,
                   argv,
-                  logfile=logfile,
-                  pidfile=pidfile,
-                  uid=uid, gid=gid,
+                  logfile=opts.logfile,
+                  pidfile=opts.pidfile,
+                  uid=opts.uid, gid=opts.gid,
                   umask=kwargs.get('umask', None),
                   workdir=kwargs.get('workdir', None),
                   app=app,
                   executable=kwargs.get('executable', None),
-                  hostname=hostname)
+                  hostname=opts.hostname)
 
 
 @click.command(cls=CeleryDaemonCommand,
@@ -365,11 +374,10 @@ def worker(ctx, hostname=None, pool_cls=None, app=None, uid=None, gid=None,
         _apply_disable_prefetch_option(app, kwargs)
         _apply_extra_cmdline_config(app, ctx)
         if kwargs.get('detach', False):
-            return _detach_worker(
-                app, kwargs,
+            return _detach_worker(app, kwargs, _DetachOptions(
                 logfile=logfile, pidfile=pidfile,
                 uid=uid, gid=gid, hostname=hostname,
-            )
+            ))
 
         maybe_drop_privileges(uid=uid, gid=gid)
         worker = app.Worker(

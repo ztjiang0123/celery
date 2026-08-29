@@ -1,11 +1,16 @@
 """The ``celery graph`` command."""
 import sys
+from collections import namedtuple
 from operator import itemgetter
 
 import click
 
 from celery.bin.base import CeleryCommand, handle_preload_options, handle_remote_command_error
 from celery.utils.graph import DependencyGraph, GraphFormatter
+
+# Bundles the endpoints and node classes needed while drawing the workers graph.
+_GraphContext = namedtuple('_GraphContext', ('broker', 'backend',
+                                             'worker_cls', 'thread_cls'))
 
 
 def _resolve_workers_and_threads(app, args):
@@ -36,17 +41,16 @@ def _resolve_broker_uri(app, args):
         handle_remote_command_error('graph workers', exc)
 
 
-def _add_worker_arcs(deps, workers, threads_for, broker, backend,
-                     worker_cls, thread_cls):
+def _add_worker_arcs(deps, workers, threads_for, gctx):
     """Add each worker (and its threads) to the dependency graph."""
     for i, worker in enumerate(workers):
-        worker = worker_cls(worker, pos=i)
+        worker = gctx.worker_cls(worker, pos=i)
         deps.add_arc(worker)
-        deps.add_edge(worker, broker)
-        if backend:
-            deps.add_edge(worker, backend)
+        deps.add_edge(worker, gctx.broker)
+        if gctx.backend:
+            deps.add_edge(worker, gctx.backend)
         for thread in threads_for.get(worker._label) or ():
-            thread = thread_cls(thread)
+            thread = gctx.thread_cls(thread)
             deps.add_arc(thread)
             deps.add_edge(thread, worker)
 
@@ -220,7 +224,8 @@ def workers(ctx):
     deps.add_arc(broker)
     if backend:
         deps.add_arc(backend)
-    _add_worker_arcs(deps, workers, threads_for, broker, backend,
-                     Worker, Thread)
+    gctx = _GraphContext(broker=broker, backend=backend,
+                         worker_cls=Worker, thread_cls=Thread)
+    _add_worker_arcs(deps, workers, threads_for, gctx)
 
     deps.to_dot(sys.stdout)

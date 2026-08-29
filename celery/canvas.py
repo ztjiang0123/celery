@@ -10,7 +10,7 @@ import operator
 import types
 import warnings
 from abc import ABCMeta, abstractmethod
-from collections import deque
+from collections import deque, namedtuple
 from collections.abc import MutableSequence
 from copy import deepcopy
 from functools import partial as _partial
@@ -127,6 +127,12 @@ def _merge_shared_value(d1, d2, key, value, aggregate_duplicates):
     elif aggregate_duplicates:
         d1[key] = [] if d1[key] is None else list(d1[key])
         d1[key].append(d2[key])
+
+
+# Chain-wide freeze parameters shared by every step in ``_chain.prepare_steps``.
+_FreezeOptions = namedtuple('_FreezeOptions',
+                            ('root_id', 'last_task_id', 'group_id',
+                             'chord_body', 'group_index'))
 
 
 class StampingVisitor(metaclass=ABCMeta):
@@ -1198,6 +1204,10 @@ class _chain(Signature):
         prev_res = None
         tasks, results = [], []
         i = 0
+        # Freeze options that are constant for every step in this chain.
+        freeze_opts = _FreezeOptions(
+            root_id=root_id, last_task_id=last_task_id, group_id=group_id,
+            chord_body=chord_body, group_index=group_index)
         # NOTE: We are doing this in reverse order.
         # The result is a list of tasks in reverse order, that is
         # passed as the ``chain`` message field.
@@ -1223,19 +1233,19 @@ class _chain(Signature):
 
             # TODO why isn't this asserting is_last_task == False?
             if isinstance(task, group) and prev_task:
+                # the group's body (prev_task) has already been appended, so
+                # drop it before turning the pair into a chord.
+                tasks.pop()
+                results.pop()
                 task = self._upgrade_group_to_chord(
-                    task, prev_task, prev_res, root_id, app, tasks, results)
+                    task, prev_task, prev_res, root_id, app)
                 # Do not overwrite prev_res here; it may intentionally be a
                 # GroupResult (see #8903). But we must reset prev_task after the
                 # pop so we don't link a chord to its own body when
                 # use_link/task_protocol==1.
                 prev_task = tasks[-1] if tasks else None
 
-            res = self._freeze_step_task(
-                task, is_last_task,
-                root_id=root_id, last_task_id=last_task_id,
-                group_id=group_id, chord_body=chord_body,
-                group_index=group_index)
+            res = self._freeze_step_task(task, is_last_task, freeze_opts)
 
             i += 1
 
@@ -1283,15 +1293,12 @@ class _chain(Signature):
         return task
 
     @staticmethod
-    def _upgrade_group_to_chord(task, prev_task, prev_res, root_id, app,
-                                tasks, results):
+    def _upgrade_group_to_chord(task, prev_task, prev_res, root_id, app):
         """Automatically upgrade ``group(...) | s`` to ``chord(group, s)``.
 
         For chords we freeze by pretending it's a normal signature instead of a
-        group, so the already-appended body task/result are popped first.
+        group; the caller pops the already-appended body task/result first.
         """
-        tasks.pop()
-        results.pop()
         try:
             return chord(
                 task, body=prev_task,
@@ -1308,20 +1315,23 @@ class _chain(Signature):
             )
 
     @staticmethod
-    def _freeze_step_task(task, is_last_task, *, root_id, last_task_id,
-                          group_id, chord_body, group_index):
-        """Freeze a step, giving the last task the chain-level sync options."""
+    def _freeze_step_task(task, is_last_task, opts):
+        """Freeze a step, giving the last task the chain-level sync options.
+
+        ``opts`` is a :class:`_FreezeOptions` bundle of the chain-wide freeze
+        parameters.
+        """
         if not is_last_task:
-            return task.freeze(root_id=root_id)
+            return task.freeze(root_id=opts.root_id)
         # chain(task_id=id) means task id is set for the last task
         # in the chain.  If the chord is part of a chord/group
         # then that chord/group must synchronize based on the
         # last task in the chain, so we only set the group_id and
         # chord callback for the last task.
         return task.freeze(
-            last_task_id,
-            root_id=root_id, group_id=group_id, chord=chord_body,
-            group_index=group_index,
+            opts.last_task_id,
+            root_id=opts.root_id, group_id=opts.group_id, chord=opts.chord_body,
+            group_index=opts.group_index,
         )
 
     @staticmethod
