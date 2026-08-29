@@ -427,24 +427,36 @@ def find_deprecated_settings(source):  # pragma: no cover
     return source
 
 
+def _find_in_namespace(namespace, name):
+    """Look up ``name`` within a single namespace, or return ``None``."""
+    return searchresult(namespace, name, NAMESPACES[namespace][name])
+
+
+def _find_across_namespaces(name):
+    """Search every namespace for ``name``, or return ``None`` if absent."""
+    for ns, opts in NAMESPACES.items():
+        # The name may itself be a namespace (e.g. 'celery').
+        if ns.lower() == name:
+            return searchresult(None, ns, opts)
+        if isinstance(opts, dict) and name in opts:
+            return searchresult(ns, name, opts[name])
+    return None
+
+
 @memoize(maxsize=None)
 def find(name, namespace='celery'):
     """Find setting by name."""
-    # - Try specified name-space first.
+    name = name.lower()
     namespace = namespace.lower()
-    try:
-        return searchresult(
-            namespace, name.lower(), NAMESPACES[namespace][name.lower()],
-        )
-    except KeyError:
-        # - Try all the other namespaces.
-        for ns, opts in NAMESPACES.items():
-            if ns.lower() == name.lower():
-                return searchresult(None, ns, opts)
-            elif isinstance(opts, dict):
-                try:
-                    return searchresult(ns, name.lower(), opts[name.lower()])
-                except KeyError:
-                    pass
+
+    # - Try the specified namespace first.
+    if namespace in NAMESPACES and name in NAMESPACES[namespace]:
+        return _find_in_namespace(namespace, name)
+
+    # - Then try all the other namespaces.
+    result = _find_across_namespaces(name)
+    if result is not None:
+        return result
+
     # - See if name is a qualname last.
-    return searchresult(None, name.lower(), DEFAULTS[name.lower()])
+    return searchresult(None, name, DEFAULTS[name])
