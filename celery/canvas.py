@@ -98,23 +98,35 @@ def _merge_dictionaries(d1, d2, aggregate_duplicates=True):
         return
 
     for key, value in d1.items():
-        if key in d2:
-            if isinstance(value, dict):
-                _merge_dictionaries(d1[key], d2[key])
-            else:
-                if isinstance(value, (int, float, str)):
-                    d1[key] = [value] if aggregate_duplicates else value
-                if isinstance(d2[key], list) and isinstance(d1[key], list):
-                    d1[key].extend(d2[key])
-                elif aggregate_duplicates:
-                    if d1[key] is None:
-                        d1[key] = []
-                    else:
-                        d1[key] = list(d1[key])
-                    d1[key].append(d2[key])
+        if key not in d2:
+            continue
+        if isinstance(value, dict):
+            _merge_dictionaries(d1[key], d2[key])
+        else:
+            _merge_shared_value(d1, d2, key, value, aggregate_duplicates)
+
     for key, value in d2.items():
         if key not in d1:
             d1[key] = value
+
+
+def _merge_shared_value(d1, d2, key, value, aggregate_duplicates):
+    """Merge a non-dict value for ``key`` that exists in both dictionaries.
+
+    ``d1[key]`` currently holds ``value`` (from ``d1``); the corresponding
+    ``d2[key]`` value is combined into it in place.
+    """
+    # Scalars start out as a single-item list so duplicates can accumulate,
+    # unless we've been told to let d2 override instead.
+    if isinstance(value, (int, float, str)):
+        d1[key] = [value] if aggregate_duplicates else value
+
+    both_lists = isinstance(d2[key], list) and isinstance(d1[key], list)
+    if both_lists:
+        d1[key].extend(d2[key])
+    elif aggregate_duplicates:
+        d1[key] = [] if d1[key] is None else list(d1[key])
+        d1[key].append(d2[key])
 
 
 class StampingVisitor(metaclass=ABCMeta):
@@ -960,51 +972,63 @@ class _chain(Signature):
 
     def __or__(self, other):
         if isinstance(other, group):
-            # unroll group with one member
-            other = maybe_unroll_group(other)
-            if not isinstance(other, group):
-                return self.__or__(other)
-            # chain | group() -> chain
-            tasks = self.unchain_tasks()
-            if not tasks:
-                # If the chain is empty, return the group
-                return other
-            if isinstance(tasks[-1], chord):
-                # CHAIN [last item is chord] | GROUP -> chain with chord body.
-                tasks[-1].body = tasks[-1].body | other
-                return type(self)(tasks, app=self.app)
-            # use type(self) for _chain subclasses
-            return type(self)(seq_concat_item(
-                tasks, other), app=self._app)
+            return self._or_group(other)
         elif isinstance(other, _chain):
             # chain | chain -> chain
             return reduce(operator.or_, other.unchain_tasks(), self)
         elif isinstance(other, Signature):
-            if self.tasks and isinstance(self.tasks[-1], group):
-                # CHAIN [last item is group] | TASK -> chord
-                sig = self.clone()
-                sig.tasks[-1] = chord(
-                    sig.tasks[-1], other, app=self._app)
-                # In the scenario where the second-to-last item in a chain is a chord,
-                # it leads to a situation where two consecutive chords are formed.
-                # In such cases, a further upgrade can be considered.
-                # This would involve chaining the body of the second-to-last chord with the last chord."
-                if len(sig.tasks) > 1 and isinstance(sig.tasks[-2], chord):
-                    sig.tasks[-2].body = sig.tasks[-2].body | sig.tasks[-1]
-                    sig.tasks = sig.tasks[:-1]
-                return sig
-            elif self.tasks and isinstance(self.tasks[-1], chord) and not isinstance(other, chord):
-                # CHAIN [last item is chord] | TASK -> chain with chord body.
-                sig = self.clone()
-                sig.tasks[-1].body = sig.tasks[-1].body | other
-                return sig
-            else:
-                # chain | task/chord -> chain
-                # use type(self) for _chain subclasses
-                return type(self)(seq_concat_item(
-                    self.unchain_tasks(), other), app=self._app)
+            return self._or_signature(other)
         else:
             return NotImplemented
+
+    def _or_group(self, other):
+        # unroll group with one member
+        other = maybe_unroll_group(other)
+        if not isinstance(other, group):
+            return self.__or__(other)
+        # chain | group() -> chain
+        tasks = self.unchain_tasks()
+        if not tasks:
+            # If the chain is empty, return the group
+            return other
+        if isinstance(tasks[-1], chord):
+            # CHAIN [last item is chord] | GROUP -> chain with chord body.
+            tasks[-1].body = tasks[-1].body | other
+            return type(self)(tasks, app=self.app)
+        # use type(self) for _chain subclasses
+        return type(self)(seq_concat_item(
+            tasks, other), app=self._app)
+
+    def _or_signature(self, other):
+        last_is_group = self.tasks and isinstance(self.tasks[-1], group)
+        if last_is_group:
+            # CHAIN [last item is group] | TASK -> chord
+            return self._append_task_as_chord(other)
+
+        last_is_chord = self.tasks and isinstance(self.tasks[-1], chord)
+        if last_is_chord and not isinstance(other, chord):
+            # CHAIN [last item is chord] | TASK -> chain with chord body.
+            sig = self.clone()
+            sig.tasks[-1].body = sig.tasks[-1].body | other
+            return sig
+
+        # chain | task/chord -> chain
+        # use type(self) for _chain subclasses
+        return type(self)(seq_concat_item(
+            self.unchain_tasks(), other), app=self._app)
+
+    def _append_task_as_chord(self, other):
+        sig = self.clone()
+        sig.tasks[-1] = chord(
+            sig.tasks[-1], other, app=self._app)
+        # In the scenario where the second-to-last item in a chain is a chord,
+        # it leads to a situation where two consecutive chords are formed.
+        # In such cases, a further upgrade can be considered.
+        # This would involve chaining the body of the second-to-last chord with the last chord."
+        if len(sig.tasks) > 1 and isinstance(sig.tasks[-2], chord):
+            sig.tasks[-2].body = sig.tasks[-2].body | sig.tasks[-1]
+            sig.tasks = sig.tasks[:-1]
+        return sig
 
     def clone(self, *args, **kwargs):
         to_signature = maybe_signature
@@ -1185,28 +1209,12 @@ class _chain(Signature):
             # if i = 0, this is the last task - again, because we're reversed
             is_first_task, is_last_task = not steps, not i
 
-            if not isinstance(task, abstract.CallableSignature):
-                task = from_dict(task, app=app)
-            if isinstance(task, group):
-                # when groups are nested, they are unrolled - all tasks within
-                # groups should be called in parallel
-                task = maybe_unroll_group(task)
-                if (
-                    isinstance(task, group) and
-                    isinstance(task.tasks, (list, tuple)) and
-                    not task.tasks and
-                    (steps or prev_task)
-                ):
-                    continue
+            task = self._normalize_step_task(task, app, from_dict)
+            if self._is_droppable_empty_group(task, steps, prev_task):
+                continue
 
-            # first task gets partial args from chain
-            if clone:
-                if is_first_task:
-                    task = task.clone(args, kwargs)
-                else:
-                    task = task.clone()
-            elif is_first_task:
-                task.args = tuple(args) + tuple(task.args)
+            task = self._clone_step_task(
+                task, is_first_task, clone, args, kwargs)
 
             if isinstance(task, _chain):
                 # splice (unroll) the chain
@@ -1215,60 +1223,24 @@ class _chain(Signature):
 
             # TODO why isn't this asserting is_last_task == False?
             if isinstance(task, group) and prev_task:
-                # automatically upgrade group(...) | s to chord(group, s)
-                # for chords we freeze by pretending it's a normal
-                # signature instead of a group.
-                tasks.pop()
-                results.pop()
-                try:
-                    task = chord(
-                        task, body=prev_task,
-                        task_id=prev_res.task_id, root_id=root_id, app=app,
-                    )
-                except AttributeError:
-                    # A GroupResult does not have a task_id since it consists
-                    # of multiple tasks.
-                    # We therefore, have to construct the chord without it.
-                    # Issues #5467, #3585.
-                    task = chord(
-                        task, body=prev_task,
-                        root_id=root_id, app=app,
-                    )
-                # Do not overwrite prev_res here; it may intentionally be a GroupResult (see #8903).
-                # But we must reset prev_task after the pop so we don't link a chord to its own body
-                # when use_link/task_protocol==1.
+                task = self._upgrade_group_to_chord(
+                    task, prev_task, prev_res, root_id, app, tasks, results)
+                # Do not overwrite prev_res here; it may intentionally be a
+                # GroupResult (see #8903). But we must reset prev_task after the
+                # pop so we don't link a chord to its own body when
+                # use_link/task_protocol==1.
                 prev_task = tasks[-1] if tasks else None
 
-            if is_last_task:
-                # chain(task_id=id) means task id is set for the last task
-                # in the chain.  If the chord is part of a chord/group
-                # then that chord/group must synchronize based on the
-                # last task in the chain, so we only set the group_id and
-                # chord callback for the last task.
-                res = task.freeze(
-                    last_task_id,
-                    root_id=root_id, group_id=group_id, chord=chord_body,
-                    group_index=group_index,
-                )
-            else:
-                res = task.freeze(root_id=root_id)
+            res = self._freeze_step_task(
+                task, is_last_task,
+                root_id=root_id, last_task_id=last_task_id,
+                group_id=group_id, chord_body=chord_body,
+                group_index=group_index)
 
             i += 1
 
-            if prev_task:
-                if use_link:
-                    # link previous task to this task.
-                    task.link(prev_task)
-
-                if prev_res and not prev_res.parent:
-                    prev_res.parent = res
-
-            if link_error:
-                for errback in maybe_list(link_error):
-                    task.link_error(errback)
-                    # Propagate to chord body for chord_error_from_stack.
-                    if isinstance(task, chord) and task.body:
-                        task.body.link_error(errback)
+            self._link_step_to_prev(task, res, prev_task, prev_res, use_link)
+            self._link_step_errors(task, link_error)
 
             tasks.append(task)
             results.append(res)
@@ -1276,19 +1248,116 @@ class _chain(Signature):
             prev_task, prev_res = task, res
             if isinstance(task, chord):
                 app.backend.ensure_chords_allowed()
-                # If the task is a chord, and the body is a chain
-                # the chain has already been prepared, and res is
-                # set to the last task in the callback chain.
-
-                # We need to change that so that it points to the
-                # group result object.
-                node = res
-                while node.parent:
-                    node = node.parent
-                prev_res = node
+                prev_res = self._chord_group_result(res)
         # Use the last task's actual ID, not the input parameter.
         self.id = results[0].id if results else last_task_id
         return tasks, results
+
+    @staticmethod
+    def _normalize_step_task(task, app, from_dict):
+        """Coerce a raw step into a signature, unrolling single-member groups."""
+        if not isinstance(task, abstract.CallableSignature):
+            task = from_dict(task, app=app)
+        if isinstance(task, group):
+            # when groups are nested, they are unrolled - all tasks within
+            # groups should be called in parallel
+            task = maybe_unroll_group(task)
+        return task
+
+    @staticmethod
+    def _is_droppable_empty_group(task, steps, prev_task):
+        """An empty group in the middle of a chain contributes nothing."""
+        if not isinstance(task, group):
+            return False
+        is_empty = isinstance(task.tasks, (list, tuple)) and not task.tasks
+        return is_empty and bool(steps or prev_task)
+
+    @staticmethod
+    def _clone_step_task(task, is_first_task, clone, args, kwargs):
+        """Apply the chain's partial args to the task, cloning when requested."""
+        if clone:
+            # first task gets partial args from chain
+            return task.clone(args, kwargs) if is_first_task else task.clone()
+        if is_first_task:
+            task.args = tuple(args) + tuple(task.args)
+        return task
+
+    @staticmethod
+    def _upgrade_group_to_chord(task, prev_task, prev_res, root_id, app,
+                                tasks, results):
+        """Automatically upgrade ``group(...) | s`` to ``chord(group, s)``.
+
+        For chords we freeze by pretending it's a normal signature instead of a
+        group, so the already-appended body task/result are popped first.
+        """
+        tasks.pop()
+        results.pop()
+        try:
+            return chord(
+                task, body=prev_task,
+                task_id=prev_res.task_id, root_id=root_id, app=app,
+            )
+        except AttributeError:
+            # A GroupResult does not have a task_id since it consists
+            # of multiple tasks.
+            # We therefore, have to construct the chord without it.
+            # Issues #5467, #3585.
+            return chord(
+                task, body=prev_task,
+                root_id=root_id, app=app,
+            )
+
+    @staticmethod
+    def _freeze_step_task(task, is_last_task, *, root_id, last_task_id,
+                          group_id, chord_body, group_index):
+        """Freeze a step, giving the last task the chain-level sync options."""
+        if not is_last_task:
+            return task.freeze(root_id=root_id)
+        # chain(task_id=id) means task id is set for the last task
+        # in the chain.  If the chord is part of a chord/group
+        # then that chord/group must synchronize based on the
+        # last task in the chain, so we only set the group_id and
+        # chord callback for the last task.
+        return task.freeze(
+            last_task_id,
+            root_id=root_id, group_id=group_id, chord=chord_body,
+            group_index=group_index,
+        )
+
+    @staticmethod
+    def _link_step_to_prev(task, res, prev_task, prev_res, use_link):
+        """Link the current step to the previously processed one."""
+        if not prev_task:
+            return
+        if use_link:
+            # link previous task to this task.
+            task.link(prev_task)
+        if prev_res and not prev_res.parent:
+            prev_res.parent = res
+
+    @staticmethod
+    def _chord_group_result(res):
+        """Walk up to the chord's group result.
+
+        If the chord body is a chain it has already been prepared and ``res``
+        points at the last task in the callback chain, so we climb the parent
+        links until we reach the group result object.
+        """
+        node = res
+        while node.parent:
+            node = node.parent
+        return node
+
+    @staticmethod
+    def _link_step_errors(task, link_error):
+        """Attach every error callback to the task (and any chord body)."""
+        if not link_error:
+            return
+        for errback in maybe_list(link_error):
+            task.link_error(errback)
+            # Propagate to chord body for chord_error_from_stack.
+            if isinstance(task, chord) and task.body:
+                task.body.link_error(errback)
 
     def apply(self, args=None, kwargs=None, **options):
         args = args if args else ()

@@ -8,6 +8,49 @@ from celery.bin.base import CeleryCommand, handle_preload_options, handle_remote
 from celery.utils.graph import DependencyGraph, GraphFormatter
 
 
+def _resolve_workers_and_threads(app, args):
+    """Return the list of worker names and their thread counts.
+
+    Prefer values passed explicitly via ``args``; otherwise inspect the
+    running workers for their pool concurrency.
+    """
+    try:
+        return args['nodes'], (args.get('threads') or [])
+    except KeyError:
+        pass
+    try:
+        replies = app.control.inspect().stats() or {}
+    except Exception as exc:
+        handle_remote_command_error('graph workers', exc)
+    worker_names, thread_counts = [], []
+    for worker, reply in replies.items():
+        worker_names.append(worker)
+        thread_counts.append(reply['pool']['max-concurrency'])
+    return worker_names, thread_counts
+
+
+def _resolve_broker_uri(app, args):
+    try:
+        return args.get('broker', app.connection_for_read().as_uri())
+    except Exception as exc:
+        handle_remote_command_error('graph workers', exc)
+
+
+def _add_worker_arcs(deps, workers, threads_for, broker, backend,
+                     worker_cls, thread_cls):
+    """Add each worker (and its threads) to the dependency graph."""
+    for i, worker in enumerate(workers):
+        worker = worker_cls(worker, pos=i)
+        deps.add_arc(worker)
+        deps.add_edge(worker, broker)
+        if backend:
+            deps.add_edge(worker, backend)
+        for thread in threads_for.get(worker._label) or ():
+            thread = thread_cls(thread)
+            deps.add_arc(thread)
+            deps.add_edge(thread, worker)
+
+
 @click.group()
 @click.pass_context
 @handle_preload_options
@@ -149,55 +192,35 @@ def workers(ctx):
                 name[0], subscript(size - (max - 1)))
         return l
 
+    def build_threads_for(workers, threads, worker_count):
+        """Map each abbreviated worker label to its abbreviated thread list.
+
+        ``worker_count`` is the number of workers *before* abbreviation, so the
+        thread list is trimmed in step with how the worker list was reduced.
+        """
+        if Wmax and worker_count > Wmax:
+            threads = threads[0:3] + [threads[-1]]
+        threads_for = {}
+        for i, thread_count in enumerate(threads):
+            threads_for[workers[i]] = maybe_abbr(
+                list(range(int(thread_count))), 'P', Tmax,
+            )
+        return threads_for
+
     app = ctx.obj.app
-    try:
-        workers = args['nodes']
-        threads = args.get('threads') or []
-    except KeyError:
-        try:
-            replies = app.control.inspect().stats() or {}
-        except Exception as exc:
-            handle_remote_command_error('graph workers', exc)
-        workers, threads = [], []
-        for worker, reply in replies.items():
-            workers.append(worker)
-            threads.append(reply['pool']['max-concurrency'])
-
-    wlen = len(workers)
+    workers, threads = _resolve_workers_and_threads(app, args)
     backend = args.get('backend', app.conf.result_backend)
-    threads_for = {}
+    worker_count = len(workers)
     workers = maybe_abbr(workers, 'Worker')
-    if Wmax and wlen > Wmax:
-        threads = threads[0:3] + [threads[-1]]
-    for i, threads in enumerate(threads):
-        threads_for[workers[i]] = maybe_abbr(
-            list(range(int(threads))), 'P', Tmax,
-        )
+    threads_for = build_threads_for(workers, threads, worker_count)
 
-    try:
-        broker_uri = args.get('broker', app.connection_for_read().as_uri())
-    except Exception as exc:
-        handle_remote_command_error('graph workers', exc)
-    broker = Broker(broker_uri)
+    broker = Broker(_resolve_broker_uri(app, args))
     backend = Backend(backend) if backend else None
     deps = DependencyGraph(formatter=Formatter())
     deps.add_arc(broker)
     if backend:
         deps.add_arc(backend)
-    curworker = [0]
-    for i, worker in enumerate(workers):
-        worker = Worker(worker, pos=i)
-        deps.add_arc(worker)
-        deps.add_edge(worker, broker)
-        if backend:
-            deps.add_edge(worker, backend)
-        threads = threads_for.get(worker._label)
-        if threads:
-            for thread in threads:
-                thread = Thread(thread)
-                deps.add_arc(thread)
-                deps.add_edge(thread, worker)
-
-        curworker[0] += 1
+    _add_worker_arcs(deps, workers, threads_for, broker, backend,
+                     Worker, Thread)
 
     deps.to_dot(sys.stdout)
