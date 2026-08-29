@@ -375,41 +375,65 @@ def bugreport(app):
     )
 
 
-def find_app(app, symbol_by_name=symbol_by_name, imp=import_from_cwd):
-    """Find app by name."""
+def _find_app_module_attr(sym, attr, module_error):
+    """Return ``sym.<attr>`` if it is a Celery instance, else raise AttributeError.
+
+    A module found under the attribute is treated as "not found" (raising
+    ``AttributeError`` with ``module_error``) so the caller can continue
+    looking.
+    """
+    found = getattr(sym, attr)
+    if isinstance(found, ModuleType):
+        raise AttributeError(module_error)
+    return found
+
+
+def _find_app_in_module(sym, app, symbol_by_name, imp):
+    """Locate a Celery app defined inside the module ``sym``."""
     from .base import Celery
 
+    try:
+        return _find_app_module_attr(sym, 'app', module_error=None)
+    except AttributeError:
+        pass
+
+    try:
+        return _find_app_module_attr(
+            sym, 'celery',
+            module_error="attribute 'celery' is the celery module "
+                         "not the instance of celery",
+        )
+    except AttributeError as exc:
+        # Remember this error: it is re-raised if no app can be found so
+        # that callers keep seeing the missing 'celery' attribute error.
+        not_found_exc = exc
+
+    # Try a conventional ``<package>.celery`` submodule.
+    if getattr(sym, '__path__', None):
+        try:
+            return find_app(
+                f'{app}.celery',
+                symbol_by_name=symbol_by_name, imp=imp,
+            )
+        except ImportError:
+            pass
+
+    # Fall back to scanning the module's namespace for any Celery instance.
+    for suspect in vars(sym).values():
+        if isinstance(suspect, Celery):
+            return suspect
+
+    raise not_found_exc
+
+
+def find_app(app, symbol_by_name=symbol_by_name, imp=import_from_cwd):
+    """Find app by name."""
     try:
         sym = symbol_by_name(app, imp=imp)
     except AttributeError:
         # last part was not an attribute, but a module
         sym = imp(app)
+
     if isinstance(sym, ModuleType) and ':' not in app:
-        try:
-            found = sym.app
-            if isinstance(found, ModuleType):
-                raise AttributeError()
-        except AttributeError:
-            try:
-                found = sym.celery
-                if isinstance(found, ModuleType):
-                    raise AttributeError(
-                        "attribute 'celery' is the celery module not the instance of celery")
-            except AttributeError:
-                if getattr(sym, '__path__', None):
-                    try:
-                        return find_app(
-                            f'{app}.celery',
-                            symbol_by_name=symbol_by_name, imp=imp,
-                        )
-                    except ImportError:
-                        pass
-                for suspect in vars(sym).values():
-                    if isinstance(suspect, Celery):
-                        return suspect
-                raise
-            else:
-                return found
-        else:
-            return found
+        return _find_app_in_module(sym, app, symbol_by_name, imp)
     return sym
