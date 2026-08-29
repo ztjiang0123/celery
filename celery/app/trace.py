@@ -372,17 +372,54 @@ class _TraceContext:
             setattr(self, key, value)
 
 
-def _trace_on_error(ctx, request, exc, state=FAILURE, call_errbacks=True):
+class _TraceRun:
+    """Per-invocation state threaded through the task-tracing helpers.
+
+    ``build_tracer``'s helpers each needed most of the same call-scoped
+    values (uuid, args, the request, ids, timing, ...).  Bundling them here
+    lets every helper take just ``(ctx, run)`` instead of a long parameter
+    list, while ``tvars`` carries the six mutable trace variables.
+    """
+
+    __slots__ = (
+        'uuid', 'args', 'kwargs', 'task_request', 'root_id', 'task_priority',
+        'time_start', 'publish_result', 'track_started', 'tvars',
+    )
+
+    def __init__(self, uuid, args, kwargs, time_start):
+        self.uuid = uuid
+        self.args = args
+        self.kwargs = kwargs
+        self.time_start = time_start
+        self.task_request = None
+        self.root_id = None
+        self.task_priority = None
+        self.publish_result = False
+        self.track_started = False
+        self.tvars = _TraceVars(None, None, None, None, None, None)
+
+
+#: Where a dispatched signature should attach itself in the task tree.
+_DispatchTarget = namedtuple('_DispatchTarget', ('parent_id', 'root_id', 'priority'))
+
+
+def _trace_on_error(ctx, request, exc, retry=False):
+    """Handle an errored task, returning ``(I, R, state, retval)``.
+
+    ``retry`` selects the RETRY state and suppresses errbacks, matching the
+    historical ``on_error(..., RETRY, call_errbacks=False)`` call.
+    """
     if ctx.propagate:
         raise
+    state = RETRY if retry else FAILURE
     I = ctx.Info(state, exc)
     R = I.handle_error_state(
-        ctx.task, request, eager=ctx.eager, call_errbacks=call_errbacks,
+        ctx.task, request, eager=ctx.eager, call_errbacks=not retry,
     )
     return I, R, I.state, I.retval
 
 
-def _dispatch_multiple_callbacks(ctx, retval, callbacks, parent_id, root_id, priority):
+def _dispatch_multiple_callbacks(ctx, retval, callbacks, target):
     """Apply link callbacks when there is more than one.
 
     Groups are applied individually (so their trail is stored once); the
@@ -399,16 +436,18 @@ def _dispatch_multiple_callbacks(ctx, retval, callbacks, parent_id, root_id, pri
     for group_ in groups:
         group_.apply_async(
             (retval,),
-            parent_id=parent_id, root_id=root_id, priority=priority,
+            parent_id=target.parent_id, root_id=target.root_id,
+            priority=target.priority,
         )
     if sigs:
         group(sigs, app=ctx.app).apply_async(
             (retval,),
-            parent_id=parent_id, root_id=root_id, priority=priority,
+            parent_id=target.parent_id, root_id=target.root_id,
+            priority=target.priority,
         )
 
 
-def _dispatch_callbacks_and_chain(ctx, retval, callbacks, chain, parent_id, root_id, priority):
+def _dispatch_callbacks_and_chain(ctx, retval, callbacks, chain, target):
     """Dispatch callbacks and chain for a completed task.
 
     Dispatches link callbacks and then the next chain step.  Does NOT fire
@@ -421,17 +460,19 @@ def _dispatch_callbacks_and_chain(ctx, retval, callbacks, chain, parent_id, root
     delivery model.
     """
     if callbacks and len(callbacks) > 1:
-        _dispatch_multiple_callbacks(ctx, retval, callbacks, parent_id, root_id, priority)
+        _dispatch_multiple_callbacks(ctx, retval, callbacks, target)
     elif callbacks:
         ctx.signature(callbacks[0], app=ctx.app).apply_async(
             (retval,),
-            parent_id=parent_id, root_id=root_id, priority=priority,
+            parent_id=target.parent_id, root_id=target.root_id,
+            priority=target.priority,
         )
     if chain:
         _chsig = ctx.signature(chain[-1], app=ctx.app)
         _chsig.apply_async(
             (retval,), chain=chain[:-1],
-            parent_id=parent_id, root_id=root_id, priority=priority,
+            parent_id=target.parent_id, root_id=target.root_id,
+            priority=target.priority,
         )
 
 
@@ -454,7 +495,7 @@ def _redispatch_deduplicated_result(ctx, task_request, uuid, r):
         meta = r._get_task_meta()
         stored_retval = meta.get('result')
         # Children are populated by mark_as_done on the original execution.
-        # If present, callbacks were already dispatched — skip to avoid
+        # If present, callbacks were already dispatched -- skip to avoid
         # duplicates.  Requires the backend to persist extended result
         # metadata (result_extended=True).
         children = meta.get('children')
@@ -463,7 +504,7 @@ def _redispatch_deduplicated_result(ctx, task_request, uuid, r):
         if (callbacks or chain) and not children:
             _dispatch_callbacks_and_chain(
                 ctx, stored_retval, callbacks, chain,
-                parent_id=uuid, root_id=root_id, priority=priority,
+                _DispatchTarget(uuid, root_id, priority),
             )
         ctx.successful_requests.add(task_request.id)
     except MemoryError:
@@ -506,14 +547,14 @@ def _is_duplicate_success(ctx, task_request, uuid):
     return True
 
 
-def _on_task_success(ctx, tvars, uuid, args, kwargs, task_request,
-                     root_id, task_priority, time_start, publish_result):
+def _on_task_success(ctx, run):
     """Handle the success path: dispatch callbacks, store, report.
 
     Mirrors the historical ``else`` branch of the TRACE block and returns
     the (possibly updated) ``_TraceVars`` tuple.
     """
-    R, I, T, Rstr, retval, state = tvars
+    R, I, T, Rstr, retval, state = run.tvars
+    uuid, task_request = run.uuid, run.task_request
     task = ctx.task
     try:
         # callback tasks must be applied before the result is stored, so
@@ -524,18 +565,18 @@ def _on_task_success(ctx, tvars, uuid, args, kwargs, task_request,
         # times :( (Issue #1936)
         _dispatch_callbacks_and_chain(
             ctx, retval, task.request.callbacks, task_request.chain,
-            parent_id=uuid, root_id=root_id, priority=task_priority,
+            _DispatchTarget(uuid, run.root_id, run.task_priority),
         )
-        task.backend.mark_as_done(uuid, retval, task_request, publish_result)
+        task.backend.mark_as_done(uuid, retval, task_request, run.publish_result)
     except EncodeError as exc:
         I, R, state, retval = _trace_on_error(ctx, task_request, exc)
         # MEMORY LEAK FIX: Clear traceback frames to prevent memory retention (Issue #8882)
         traceback_clear(exc)
     else:
         Rstr = saferepr(R, ctx.resultrepr_maxsize)
-        T = ctx.monotonic() - time_start
+        T = ctx.monotonic() - run.time_start
         if ctx.task_on_success:
-            ctx.task_on_success(retval, uuid, args, kwargs)
+            ctx.task_on_success(retval, uuid, run.args, run.kwargs)
         if ctx.success_receivers:
             send_success(sender=task, result=retval)
         if ctx._does_info:
@@ -544,14 +585,13 @@ def _on_task_success(ctx, tvars, uuid, args, kwargs, task_request,
                 'name': get_task_name(task_request, ctx.name),
                 'return_value': Rstr,
                 'runtime': T,
-                'args': task_request.get('argsrepr') or safe_repr(args),
-                'kwargs': task_request.get('kwargsrepr') or safe_repr(kwargs),
+                'args': task_request.get('argsrepr') or safe_repr(run.args),
+                'kwargs': task_request.get('kwargsrepr') or safe_repr(run.kwargs),
             })
     return _TraceVars(R, I, T, Rstr, retval, state)
 
 
-def _run_and_classify(ctx, tvars, uuid, args, kwargs, task_request,
-                      root_id, task_priority, time_start, publish_result):
+def _run_and_classify(ctx, run):
     """Run the task body and classify its outcome into trace variables.
 
     Corresponds to the historical TRACE ``try/except/else`` block: invokes
@@ -559,7 +599,9 @@ def _run_and_classify(ctx, tvars, uuid, args, kwargs, task_request,
     state, and dispatches the success path.  Returns the updated
     ``_TraceVars`` tuple.
     """
-    R, I, T, Rstr, retval, state = tvars
+    R, I, T, Rstr, retval, state = run.tvars
+    uuid, args, kwargs = run.uuid, run.args, run.kwargs
+    task_request = run.task_request
     task, Info = ctx.task, ctx.Info
     try:
         if ctx.task_before_start:
@@ -580,8 +622,7 @@ def _run_and_classify(ctx, tvars, uuid, args, kwargs, task_request,
         # MEMORY LEAK FIX: Clear traceback frames to prevent memory retention (Issue #8882)
         traceback_clear(exc)
     except Retry as exc:
-        I, R, state, retval = _trace_on_error(
-            ctx, task_request, exc, RETRY, call_errbacks=False)
+        I, R, state, retval = _trace_on_error(ctx, task_request, exc, retry=True)
         # MEMORY LEAK FIX: Clear traceback frames to prevent memory retention (Issue #8882)
         traceback_clear(exc)
     except Exception as exc:
@@ -591,11 +632,8 @@ def _run_and_classify(ctx, tvars, uuid, args, kwargs, task_request,
     except BaseException:
         raise
     else:
-        return _on_task_success(
-            ctx, _TraceVars(R, I, T, Rstr, retval, state),
-            uuid, args, kwargs, task_request,
-            root_id, task_priority, time_start, publish_result,
-        )
+        run.tvars = _TraceVars(R, I, T, Rstr, retval, state)
+        return _on_task_success(ctx, run)
     return _TraceVars(R, I, T, Rstr, retval, state)
 
 
@@ -620,32 +658,30 @@ def _resolve_publish_result(ctx, task, ignore_result):
     return not ctx.eager and not ignore_result
 
 
-def _trace_task_lifecycle(ctx, tvars, uuid, args, kwargs, task_request,
-                          root_id, task_priority, time_start, publish_result,
-                          track_started):
+def _trace_task_lifecycle(ctx, run):
     """Run PRE / TRACE / POST inside the request-stack scope.
 
     Returns the updated ``_TraceVars`` tuple.  Assumes the task and request
     have already been pushed; the caller owns popping them.
     """
+    uuid, args, kwargs = run.uuid, run.args, run.kwargs
+    task_request = run.task_request
     task = ctx.task
+    tvars = run.tvars
     try:
         # -*- PRE -*-
         if ctx.prerun_receivers:
             send_prerun(sender=task, task_id=uuid, task=task,
                         args=args, kwargs=kwargs)
         ctx.loader_task_init(uuid, task)
-        if track_started:
+        if run.track_started:
             task.backend.store_result(
                 uuid, {'pid': ctx.pid, 'hostname': ctx.hostname}, STARTED,
                 request=task_request,
             )
 
         # -*- TRACE -*-
-        tvars = _run_and_classify(
-            ctx, tvars, uuid, args, kwargs, task_request,
-            root_id, task_priority, time_start, publish_result,
-        )
+        tvars = _run_and_classify(ctx, run)
 
         # -* POST *-
         state, retval = tvars.state, tvars.retval
@@ -672,34 +708,30 @@ def _trace_task(ctx, uuid, args, kwargs, request=None):
     # retval - is the always unmodified return value.
     # state  - is the resulting task state.
     task = ctx.task
-    tvars = _TraceVars(None, None, None, None, None, None)
-    task_request = None
-    time_start = ctx.monotonic()
+    run = _TraceRun(uuid, args, kwargs, ctx.monotonic())
     try:
         try:
             kwargs.items
         except AttributeError:
             raise InvalidTaskError('Task keyword arguments is not a mapping')
 
-        task_request = Context(request or {}, args=args,
-                               called_directly=False, kwargs=kwargs)
+        run.task_request = task_request = Context(
+            request or {}, args=args, called_directly=False, kwargs=kwargs)
 
         ignore_result = get_actual_ignore_result(task, task_request)
-        track_started = not ctx.eager and (task.track_started and not ignore_result)
-        publish_result = _resolve_publish_result(ctx, task, ignore_result)
+        run.track_started = not ctx.eager and (task.track_started and not ignore_result)
+        run.publish_result = _resolve_publish_result(ctx, task, ignore_result)
 
         if _is_duplicate_success(ctx, task_request, uuid):
+            tvars = run.tvars
             return ctx.trace_ok_t(tvars.R, tvars.I, tvars.T, tvars.Rstr)
 
         ctx.push_task(task)
-        root_id = task_request.root_id or uuid
-        task_priority = task_request.delivery_info.get('priority') if \
+        run.root_id = task_request.root_id or uuid
+        run.task_priority = task_request.delivery_info.get('priority') if \
             ctx.inherit_parent_priority else None
         ctx.push_request(task_request)
-        tvars = _trace_task_lifecycle(
-            ctx, tvars, uuid, args, kwargs, task_request,
-            root_id, task_priority, time_start, publish_result, track_started,
-        )
+        run.tvars = _trace_task_lifecycle(ctx, run)
     except MemoryError:
         raise
     except Reject:
@@ -709,10 +741,11 @@ def _trace_task(ctx, uuid, args, kwargs, request=None):
         if ctx.eager:
             raise
         R = report_internal_error(task, exc)
-        I = tvars.I
-        if task_request is not None:
-            I, _, _, _ = _trace_on_error(ctx, task_request, exc)
-        tvars = tvars._replace(R=R, I=I)
+        I = run.tvars.I
+        if run.task_request is not None:
+            I, _, _, _ = _trace_on_error(ctx, run.task_request, exc)
+        run.tvars = run.tvars._replace(R=R, I=I)
+    tvars = run.tvars
     return ctx.trace_ok_t(tvars.R, tvars.I, tvars.T, tvars.Rstr)
 
 
