@@ -61,6 +61,77 @@ _OMITTED = object()
 
 logger = get_logger(__name__)
 
+
+def _lookup_task_type(registry, name):
+    """Look up a task by ``name`` in ``registry`` without finalizing the app.
+
+    Uses the registry's ``get`` when available so we never auto-finalize the
+    app merely to check whether a locally registered task exists.
+    """
+    get = getattr(registry, 'get', None)
+    if callable(get):
+        return get(name)
+    try:
+        return registry[name]
+    except KeyError:
+        return None
+
+
+def _task_exec_option_defaults(task_type):
+    """Return non-``None`` exec options for ``task_type``, or ``None``.
+
+    These become defaults for a plain ``send_task`` call; ``None`` values are
+    dropped so they never override real defaults downstream.
+    """
+    get_exec_options = getattr(task_type, '_get_exec_options', None)
+    if not inspect.ismethod(get_exec_options):
+        return None
+    task_exec_options = get_exec_options()
+    if not task_exec_options:
+        return None
+    filtered_opts = {k: v for k, v in task_exec_options.items()
+                     if v is not None}
+    return filtered_opts or None
+
+
+def _pop_omitted_option(value, options, name):
+    """Reconcile an explicit ``send_task`` argument with ``options``.
+
+    When the caller omitted the argument (``_OMITTED``) fall back to the value
+    merged into ``options``; otherwise the explicit argument wins and any
+    task-level default in ``options`` is discarded.
+    """
+    if value is _OMITTED:
+        return options.pop(name, None)
+    options.pop(name, None)
+    return value
+
+
+def _compute_expiration_seconds(expires, now, task_id):
+    """Convert ``expires`` to a non-negative seconds value for the message."""
+    if isinstance(expires, datetime):
+        expires_s = (maybe_make_aware(expires) - now).total_seconds()
+    elif isinstance(expires, str):
+        expires_s = (maybe_make_aware(isoparse(expires)) - now).total_seconds()
+    else:
+        expires_s = expires
+
+    if expires_s < 0:
+        logger.warning(
+            f"{task_id} has an expiration date in the past ({-expires_s}s ago).\n"
+            "We assume this is intended and so we have set the "
+            "expiration date to 0 instead.\n"
+            "According to RabbitMQ's documentation:\n"
+            "\"Setting the TTL to 0 causes messages to be expired upon "
+            "reaching a queue unless they can be delivered to a "
+            "consumer immediately.\"\n"
+            "If this was unintended, please check the code which "
+            "published this task."
+        )
+        expires_s = 0
+    return expires_s
+
+
 if sys.version_info >= (3, 14):
     import annotationlib
 
@@ -843,6 +914,96 @@ class Celery:
             for pkg in fixup.autodiscover_tasks()
         ], related_name=related_name)
 
+    def _uses_native_delayed_delivery(self):
+        """Whether the active transport routes delays via quorum queues."""
+        driver_type = \
+            self.producer_pool.connections.connection.transport.driver_type
+        return detect_quorum_queues(self, driver_type)[0]
+
+    def _apply_native_delayed_delivery(self, options, eta, countdown):
+        """Rewrite ``options`` to route an ETA/countdown task via a delay queue.
+
+        Returns the (possibly adjusted) ``countdown``. Non-direct exchanges are
+        rerouted to the ``celery_delayed_27`` topic exchange; direct exchanges
+        are unsupported and only produce a warning.
+        """
+        queue = options.get("queue")
+        exchange_type = queue.exchange.type if queue else options["exchange_type"]
+        routing_key = queue.routing_key if queue else options["routing_key"]
+        exchange_name = queue.exchange.name if queue else options["exchange"]
+
+        if exchange_type == 'direct':
+            logger.warning(
+                'Direct exchanges are not supported with native delayed delivery.\n'
+                f'{exchange_name} is a direct exchange but should be a topic exchange or '
+                'a fanout exchange in order for native delayed delivery to work properly.\n'
+                'If quorum queues are used, this task may block the worker process until the ETA arrives.'
+            )
+            return countdown
+
+        if eta:
+            if isinstance(eta, str):
+                eta = isoparse(eta)
+            countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
+
+        if countdown and countdown > 0:
+            options.pop("queue", None)
+            options['routing_key'] = calculate_routing_key(
+                int(countdown), routing_key)
+            options['exchange'] = Exchange('celery_delayed_27', type='topic')
+        return countdown
+
+    def _merge_registry_exec_options(self, task_type, name, options):
+        """Merge a locally registered task's exec options into ``options``.
+
+        Only applies when ``task_type`` was not supplied by the caller; returns
+        the resolved ``(task_type, options)`` pair.
+        """
+        task_type = _lookup_task_type(self._tasks, name)
+        if task_type is not None:
+            exec_option_defaults = _task_exec_option_defaults(task_type)
+            if exec_option_defaults:
+                options = dict(exec_option_defaults, **options)
+        return task_type, options
+
+    def _publish_task_message(self, prepared, connection, producer, options):
+        """Publish a prepared task message, stripping stamped headers first.
+
+        ``prepared`` carries the ``name``, ``message``, ``task_id`` and
+        ``ignore_result`` flag of the task being published.
+        """
+        amqp = self.amqp
+        for stamp in options.pop('stamped_headers', []):
+            options.pop(stamp)
+
+        if connection:
+            producer = amqp.Producer(connection, auto_declare=False)
+
+        with self.producer_or_acquire(producer) as P:
+            with P.connection._reraise_as_library_errors():
+                if not prepared['ignore_result']:
+                    self.backend.on_task_call(P, prepared['task_id'])
+                amqp.send_task_message(
+                    P, prepared['name'], prepared['message'], **options)
+
+    def _resolve_parent_context(self, root_id, parent_id, options, conf):
+        """Fill in ``root_id``/``parent_id`` and priority from the parent task.
+
+        Returns ``(parent, root_id, parent_id)`` where ``parent`` is the
+        current worker task (or ``None`` when called outside a task).
+        """
+        parent = self.current_worker_task
+        if not parent:
+            return None, root_id, parent_id
+        if not root_id:
+            root_id = parent.request.root_id or parent.request.id
+        if not parent_id:
+            parent_id = parent.request.id
+        if conf.task_inherit_parent_priority:
+            options.setdefault(
+                'priority', parent.request.delivery_info.get('priority'))
+        return parent, root_id, parent_id
+
     def send_task(self, name, args=None, kwargs=None, countdown=None,
                   eta=None, task_id=None, producer=None, connection=None,
                   router=None, result_cls=None, expires=_OMITTED,
@@ -882,31 +1043,9 @@ class Celery:
         # auto-finalize the app (or raise when autofinalize=False) merely to
         # check whether a locally registered task exists. Remote/unregistered
         # task names should still be sendable without finalizing the app.
-        resolved_from_registry = False
         if task_type is None:
-            registry = self._tasks
-            get = getattr(registry, 'get', None)
-            if callable(get):
-                task_type = get(name)
-            else:
-                try:
-                    task_type = registry[name]
-                except KeyError:
-                    task_type = None
-            resolved_from_registry = task_type is not None
-        if resolved_from_registry and hasattr(task_type, '_get_exec_options'):
-            get_exec_options = task_type._get_exec_options
-            if inspect.ismethod(get_exec_options):
-                task_exec_options = get_exec_options()
-            else:
-                task_exec_options = None
-            if task_exec_options:
-                # Only merge non-None values so we don't override
-                # defaults with None.
-                filtered_opts = {k: v for k, v in task_exec_options.items()
-                                 if v is not None}
-                if filtered_opts:
-                    options = dict(filtered_opts, **options)
+            task_type, options = self._merge_registry_exec_options(
+                task_type, name, options)
 
         # Some execution options (time_limit, soft_time_limit, expires)
         # are also passed as explicit arguments to create_task_message.
@@ -914,94 +1053,26 @@ class Celery:
         # errors; use the task-level value as fallback only when the caller
         # omitted the explicit argument.  An explicit ``None`` clears
         # any task-level default merged into ``options``.
-        if time_limit is _OMITTED:
-            time_limit = options.pop('time_limit', None)
-        else:
-            options.pop('time_limit', None)
-        if soft_time_limit is _OMITTED:
-            soft_time_limit = options.pop('soft_time_limit', None)
-        else:
-            options.pop('soft_time_limit', None)
-        if expires is _OMITTED:
-            expires = options.pop('expires', None)
-        else:
-            options.pop('expires', None)
+        time_limit = _pop_omitted_option(time_limit, options, 'time_limit')
+        soft_time_limit = _pop_omitted_option(
+            soft_time_limit, options, 'soft_time_limit')
+        expires = _pop_omitted_option(expires, options, 'expires')
 
         ignore_result = options.pop('ignore_result', False)
         options = router.route(
             options, route_name or name, args, kwargs, task_type)
 
-        if eta or countdown:
-            driver_type = self.producer_pool.connections.connection.transport.driver_type
-            if detect_quorum_queues(self, driver_type)[0]:
-
-                queue = options.get("queue")
-                exchange_type = queue.exchange.type if queue else options["exchange_type"]
-                routing_key = queue.routing_key if queue else options["routing_key"]
-                exchange_name = queue.exchange.name if queue else options["exchange"]
-
-                if exchange_type != 'direct':
-                    if eta:
-                        if isinstance(eta, str):
-                            eta = isoparse(eta)
-                        countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
-
-                    if countdown:
-                        if countdown > 0:
-                            routing_key = calculate_routing_key(int(countdown), routing_key)
-                            exchange = Exchange(
-                                'celery_delayed_27',
-                                type='topic',
-                            )
-                            options.pop("queue", None)
-                            options['routing_key'] = routing_key
-                            options['exchange'] = exchange
-
-                else:
-                    logger.warning(
-                        'Direct exchanges are not supported with native delayed delivery.\n'
-                        f'{exchange_name} is a direct exchange but should be a topic exchange or '
-                        'a fanout exchange in order for native delayed delivery to work properly.\n'
-                        'If quorum queues are used, this task may block the worker process until the ETA arrives.'
-                    )
+        if (eta or countdown) and self._uses_native_delayed_delivery():
+            countdown = self._apply_native_delayed_delivery(
+                options, eta, countdown)
 
         if expires is not None:
-            if isinstance(expires, datetime):
-                expires_s = (maybe_make_aware(
-                    expires) - self.now()).total_seconds()
-            elif isinstance(expires, str):
-                expires_s = (maybe_make_aware(
-                    isoparse(expires)) - self.now()).total_seconds()
-            else:
-                expires_s = expires
-
-            if expires_s < 0:
-                logger.warning(
-                    f"{task_id} has an expiration date in the past ({-expires_s}s ago).\n"
-                    "We assume this is intended and so we have set the "
-                    "expiration date to 0 instead.\n"
-                    "According to RabbitMQ's documentation:\n"
-                    "\"Setting the TTL to 0 causes messages to be expired upon "
-                    "reaching a queue unless they can be delivered to a "
-                    "consumer immediately.\"\n"
-                    "If this was unintended, please check the code which "
-                    "published this task."
-                )
-                expires_s = 0
-
-            options["expiration"] = expires_s
+            options["expiration"] = _compute_expiration_seconds(
+                expires, self.now(), task_id)
 
         if not root_id or not parent_id:
-            parent = self.current_worker_task
-            if parent:
-                if not root_id:
-                    root_id = parent.request.root_id or parent.request.id
-                if not parent_id:
-                    parent_id = parent.request.id
-
-                if conf.task_inherit_parent_priority:
-                    options.setdefault('priority',
-                                       parent.request.delivery_info.get('priority'))
+            parent, root_id, parent_id = self._resolve_parent_context(
+                root_id, parent_id, options, conf)
 
         # alias for 'task_as_v2'
         message = amqp.create_task_message(
@@ -1015,18 +1086,11 @@ class Celery:
             replaced_task_nesting=replaced_task_nesting, **options
         )
 
-        stamped_headers = options.pop('stamped_headers', [])
-        for stamp in stamped_headers:
-            options.pop(stamp)
+        self._publish_task_message(
+            {'name': name, 'message': message, 'task_id': task_id,
+             'ignore_result': ignore_result},
+            connection, producer, options)
 
-        if connection:
-            producer = amqp.Producer(connection, auto_declare=False)
-
-        with self.producer_or_acquire(producer) as P:
-            with P.connection._reraise_as_library_errors():
-                if not ignore_result:
-                    self.backend.on_task_call(P, task_id)
-                amqp.send_task_message(P, name, message, **options)
         result = (result_cls or self.AsyncResult)(task_id)
         # We avoid using the constructor since a custom result class
         # can be used, in which case the constructor may still use
