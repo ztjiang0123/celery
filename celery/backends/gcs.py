@@ -257,7 +257,6 @@ class GCSBackend(GCSBackendBase):
         If the callback raises an exception, the chord is marked as errored.
         If the callback returns a value, the chord is marked as successful.
         """
-        app = self.app
         gid = request.group
         if not gid:
             return
@@ -269,49 +268,57 @@ class GCSBackend(GCSBackendBase):
             if deps is None:
                 return
             size = len(deps)
+
         if val > size:  # pragma: no cover
             logger.warning(
                 'Chord counter incremented too many times for %r', gid
             )
         elif val == size:
-            # Read the deps once, to reduce the number of reads from GCS ($$)
-            deps = self._restore_deps(gid, request)
-            if deps is None:
-                return
-            callback = maybe_signature(request.chord, app=app)
-            j = deps.join_native
-            try:
-                with allow_join_result():
-                    ret = j(
-                        timeout=app.conf.result_chord_join_timeout,
-                        propagate=True,
-                    )
-            except Exception as exc:  # pylint: disable=broad-except
-                try:
-                    culprit = next(deps._failed_join_report())
-                    reason = 'Dependency {0.id} raised {1!r}'.format(
-                        culprit,
-                        exc,
-                    )
-                except StopIteration:
-                    reason = repr(exc)
+            self._finalize_chord(request, gid, key)
 
-                logger.exception('Chord %r raised: %r', gid, reason)
-                chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
-                self.chord_error_from_stack(callback, chord_error)
-            else:
-                try:
-                    callback.delay(ret)
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception('Chord %r raised: %r', gid, exc)
-                    self.chord_error_from_stack(
-                        callback,
-                        ChordError(f'Callback error: {exc!r}'),
-                    )
-            finally:
-                deps.delete()
-                # Firestore doesn't have an exact ttl policy, so delete the key.
-                self._delete_chord_key(key)
+    def _finalize_chord(self, request, gid, key):
+        """Join the chord dependencies and dispatch the callback."""
+        app = self.app
+        # Read the deps once, to reduce the number of reads from GCS ($$)
+        deps = self._restore_deps(gid, request)
+        if deps is None:
+            return
+        callback = maybe_signature(request.chord, app=app)
+        try:
+            with allow_join_result():
+                ret = deps.join_native(
+                    timeout=app.conf.result_chord_join_timeout,
+                    propagate=True,
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            self._handle_chord_join_error(deps, callback, gid, exc)
+        else:
+            self._dispatch_chord_callback(callback, ret, gid)
+        finally:
+            deps.delete()
+            # Firestore doesn't have an exact ttl policy, so delete the key.
+            self._delete_chord_key(key)
+
+    def _handle_chord_join_error(self, deps, callback, gid, exc):
+        try:
+            culprit = next(deps._failed_join_report())
+            reason = 'Dependency {0.id} raised {1!r}'.format(culprit, exc)
+        except StopIteration:
+            reason = repr(exc)
+
+        logger.exception('Chord %r raised: %r', gid, reason)
+        chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
+        self.chord_error_from_stack(callback, chord_error)
+
+    def _dispatch_chord_callback(self, callback, ret, gid):
+        try:
+            callback.delay(ret)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception('Chord %r raised: %r', gid, exc)
+            self.chord_error_from_stack(
+                callback,
+                ChordError(f'Callback error: {exc!r}'),
+            )
 
     def _restore_deps(self, gid, request):
         app = self.app

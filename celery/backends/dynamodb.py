@@ -310,48 +310,37 @@ class DynamoDBBackend(KeyValueStoreBackend):
 
         return description
 
-    def _set_table_ttl(self):
-        """Enable or disable Time to Live on the table."""
-        # Get the table TTL description, and return early when possible.
-        description = self._get_table_ttl_description()
-        status = description['TimeToLiveDescription']['TimeToLiveStatus']
-        if status in ('ENABLED', 'ENABLING'):
-            cur_attr_name = \
-                description['TimeToLiveDescription']['AttributeName']
-            if self._has_ttl():
-                if cur_attr_name == self._ttl_field.name:
-                    # We want TTL enabled, and it is currently enabled or being
-                    # enabled, and on the correct attribute.
-                    logger.debug((
-                        'DynamoDB Time to Live is {situation} '
-                        'on table {table}'
-                    ).format(
-                        situation='already enabled'
-                        if status == 'ENABLED'
-                        else 'currently being enabled',
-                        table=self.table_name
-                    ))
-                    return description
+    def _ttl_already_in_desired_state(self, status, cur_attr_name):
+        """Return True when the table TTL already matches the desired state.
 
-        elif status in ('DISABLED', 'DISABLING'):
-            if not self._has_ttl():
+        Also emits the appropriate debug/warning log for the current status.
+        """
+        want_ttl = self._has_ttl()
+        if status in ('ENABLED', 'ENABLING'):
+            on_correct_attr = cur_attr_name == self._ttl_field.name
+            if want_ttl and on_correct_attr:
+                # We want TTL enabled, and it is currently enabled or being
+                # enabled, and on the correct attribute.
+                self._log_ttl_state(
+                    'already enabled' if status == 'ENABLED'
+                    else 'currently being enabled')
+                return True
+            return False
+
+        if status in ('DISABLED', 'DISABLING'):
+            if not want_ttl:
                 # We want TTL disabled, and it is currently disabled or being
                 # disabled.
-                logger.debug((
-                    'DynamoDB Time to Live is {situation} '
-                    'on table {table}'
-                ).format(
-                    situation='already disabled'
-                    if status == 'DISABLED'
-                    else 'currently being disabled',
-                    table=self.table_name
-                ))
-                return description
+                self._log_ttl_state(
+                    'already disabled' if status == 'DISABLED'
+                    else 'currently being disabled')
+                return True
+            return False
 
         # The state shouldn't ever have any value beyond the four handled
         # above, but to ease troubleshooting of potential future changes, emit
         # a log showing the unknown state.
-        else:  # pragma: no cover
+        if status not in ('ENABLED', 'ENABLING', 'DISABLED', 'DISABLING'):  # pragma: no cover
             logger.warning((
                 'Unknown DynamoDB Time to Live status {status} '
                 'on table {table}. Attempting to continue.'
@@ -359,6 +348,26 @@ class DynamoDBBackend(KeyValueStoreBackend):
                 status=status,
                 table=self.table_name
             ))
+        return False
+
+    def _log_ttl_state(self, situation):
+        logger.debug((
+            'DynamoDB Time to Live is {situation} '
+            'on table {table}'
+        ).format(
+            situation=situation,
+            table=self.table_name
+        ))
+
+    def _set_table_ttl(self):
+        """Enable or disable Time to Live on the table."""
+        # Get the table TTL description, and return early when possible.
+        description = self._get_table_ttl_description()
+        status = description['TimeToLiveDescription']['TimeToLiveStatus']
+        cur_attr_name = description['TimeToLiveDescription'].get('AttributeName')
+
+        if self._ttl_already_in_desired_state(status, cur_attr_name):
+            return description
 
         # At this point, we have one of the following situations:
         #

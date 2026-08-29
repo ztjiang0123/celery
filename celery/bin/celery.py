@@ -52,6 +52,36 @@ else:
         _PLUGINS = entry_points().select(group='celery.commands')
 
 
+def _export_cli_options_to_env(loader, broker, result_backend, config, skip_checks):
+    """Propagate global CLI options to the environment for the default app."""
+    if loader:
+        # Default app takes loader from this env (Issue #1066).
+        os.environ['CELERY_LOADER'] = loader
+    if broker:
+        os.environ['CELERY_BROKER_URL'] = broker
+    if result_backend:
+        os.environ['CELERY_RESULT_BACKEND'] = result_backend
+    if config:
+        os.environ['CELERY_CONFIG_MODULE'] = config
+    if skip_checks:
+        os.environ['CELERY_SKIP_CHECKS'] = 'true'
+
+
+def _load_app_or_fail(ctx, app):
+    """Resolve an app from its dotted path, failing the command on error."""
+    try:
+        return find_app(app)
+    except ModuleNotFoundError as e:
+        if e.name != app:
+            ctx.fail(UNABLE_TO_LOAD_APP_ERROR_OCCURRED.format(app, traceback.format_exc()))
+        ctx.fail(UNABLE_TO_LOAD_APP_MODULE_NOT_FOUND.format(e.name))
+    except AttributeError as e:
+        attribute_name = e.args[0].capitalize()
+        ctx.fail(UNABLE_TO_LOAD_APP_APP_MISSING.format(attribute_name))
+    except Exception:
+        ctx.fail(UNABLE_TO_LOAD_APP_ERROR_OCCURRED.format(app, traceback.format_exc()))
+
+
 @with_plugins(_PLUGINS)
 @click.group(cls=DYMGroup, invoke_without_command=True)
 @click.option('-A',
@@ -120,36 +150,10 @@ def celery(ctx, app, broker, result_backend, loader, config, workdir,
         click.echo(ctx.get_help())
         ctx.exit()
 
-    if loader:
-        # Default app takes loader from this env (Issue #1066).
-        os.environ['CELERY_LOADER'] = loader
-    if broker:
-        os.environ['CELERY_BROKER_URL'] = broker
-    if result_backend:
-        os.environ['CELERY_RESULT_BACKEND'] = result_backend
-    if config:
-        os.environ['CELERY_CONFIG_MODULE'] = config
-    if skip_checks:
-        os.environ['CELERY_SKIP_CHECKS'] = 'true'
+    _export_cli_options_to_env(loader, broker, result_backend, config, skip_checks)
 
     if isinstance(app, str):
-        try:
-            app = find_app(app)
-        except ModuleNotFoundError as e:
-            if e.name != app:
-                exc = traceback.format_exc()
-                ctx.fail(
-                    UNABLE_TO_LOAD_APP_ERROR_OCCURRED.format(app, exc)
-                )
-            ctx.fail(UNABLE_TO_LOAD_APP_MODULE_NOT_FOUND.format(e.name))
-        except AttributeError as e:
-            attribute_name = e.args[0].capitalize()
-            ctx.fail(UNABLE_TO_LOAD_APP_APP_MISSING.format(attribute_name))
-        except Exception:
-            exc = traceback.format_exc()
-            ctx.fail(
-                UNABLE_TO_LOAD_APP_ERROR_OCCURRED.format(app, exc)
-            )
+        app = _load_app_or_fail(ctx, app)
 
     ctx.obj = CLIContext(app=app, no_color=no_color, workdir=workdir,
                          quiet=quiet)
