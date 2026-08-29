@@ -593,8 +593,9 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     def _transport_options(self):
         return self.app.conf.get('result_backend_transport_options', {})
 
-    def _chord_return_pipeline(self, pipe, jkey, tkey, skey, encoded, group_index):
+    def _chord_return_pipeline(self, pipe, keys, encoded, group_index):
         """Build the pipeline that records this part and reads chord state."""
+        jkey, tkey, skey = keys
         pipeline = (
             pipe.zadd(jkey, {encoded: group_index}).zcount(jkey, "-inf", "+inf")
             if self._chord_zset
@@ -644,8 +645,9 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             resl, = pipeline.execute()
         return [unpack(tup, decode) for tup in resl]
 
-    def _dispatch_chord_callback(self, callback, resl, group, jkey, tkey, skey):
+    def _dispatch_chord_callback(self, callback, resl, group, keys):
         """Deliver the chord callback and clean up the group keys."""
+        jkey, tkey, skey = keys
         try:
             callback.delay(resl)
         except Exception as exc:  # pylint: disable=broad-except
@@ -676,11 +678,12 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         jkey = self.get_key_for_group(gid, '.j')
         tkey = self.get_key_for_group(gid, '.t')
         skey = self.get_key_for_group(gid, '.s')
+        keys = (jkey, tkey, skey)
         result = self.encode_result(result, state)
         encoded = self.encode([1, tid, state, result])
         with client.pipeline() as pipe:
             pipeline = self._chord_return_pipeline(
-                pipe, jkey, tkey, skey, encoded, group_index)
+                pipe, keys, encoded, group_index)
             _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
 
         totaldiff = int(totaldiff or 0)
@@ -694,7 +697,7 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             if readycount == total:
                 resl = self._read_chord_header_results(gid, jkey, total)
                 return self._dispatch_chord_callback(
-                    callback, resl, request.group, jkey, tkey, skey)
+                    callback, resl, request.group, keys)
         except ChordError as exc:
             logger.exception('Chord %r raised: %r', request.group, exc)
             return self.chord_error_from_stack(callback, exc)
