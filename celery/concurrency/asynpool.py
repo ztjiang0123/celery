@@ -280,8 +280,7 @@ class ResultHandler(_pool.ResultHandler):
         buf = BytesIO()
         return buf, buf
 
-    def _read_into(self, fd, bufv, size, __read__=__read__,
-                   readcanbuf=readcanbuf):
+    def _read_into(self, fd, bufv, size):
         """Read exactly ``size`` bytes from ``fd`` into ``bufv``.
 
         Yields (suspending the coroutine) whenever the fd is not ready,
