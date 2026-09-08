@@ -147,6 +147,29 @@ else:
         return r, w, 0
 
 
+def _is_bad_fd(fd):
+    """Return whether selecting on a single fd raises a bad-fd error.
+
+    Re-raises any :class:`OSError` that is not a bad-fd condition.
+    """
+    try:
+        select.select([fd], [], [], 0)
+    except OSError as exc:
+        if exc.errno not in SELECT_BAD_FD:
+            raise
+        return True
+    return False
+
+
+def _discard_bad_fds(readers, writers, err):
+    """Remove fds that are no longer valid from the given mutable sets."""
+    for fd in readers | writers | err:
+        if _is_bad_fd(fd):
+            readers.discard(fd)
+            writers.discard(fd)
+            err.discard(fd)
+
+
 def _select(readers=None, writers=None, err=None, timeout=0,
             poll=_select_imp):
     """Simple wrapper to :class:`~select.select`, using :`~select.poll`.
@@ -174,25 +197,13 @@ def _select(readers=None, writers=None, err=None, timeout=0,
     try:
         return poll(readers, writers, err, timeout)
     except OSError as exc:
-        _errno = exc.errno
-
-        if _errno == errno.EINTR:
-            return set(), set(), 1
-        elif _errno in SELECT_BAD_FD:
-            for fd in readers | writers | err:
-                try:
-                    select.select([fd], [], [], 0)
-                except OSError as exc:
-                    _errno = exc.errno
-
-                    if _errno not in SELECT_BAD_FD:
-                        raise
-                    readers.discard(fd)
-                    writers.discard(fd)
-                    err.discard(fd)
-            return set(), set(), 1
-        else:
+        interrupted = exc.errno == errno.EINTR
+        has_bad_fd = exc.errno in SELECT_BAD_FD
+        if not (interrupted or has_bad_fd):
             raise
+        if has_bad_fd:
+            _discard_bad_fds(readers, writers, err)
+        return set(), set(), 1
 
 
 def iterate_file_descriptors_safely(fds_iter, source_data,
@@ -260,60 +271,56 @@ class ResultHandler(_pool.ResultHandler):
         # add our custom message handler
         self.state_handlers[WORKER_UP] = self.on_process_alive
 
+    @staticmethod
+    def _new_message_buffer(size, readcanbuf=readcanbuf, BytesIO=BytesIO):
+        """Return a ``(buf, bufv)`` pair sized to receive ``size`` bytes."""
+        if readcanbuf:
+            buf = bytearray(size)
+            return buf, memoryview(buf)
+        buf = BytesIO()
+        return buf, buf
+
+    def _read_into(self, fd, bufv, size, __read__=__read__,
+                   readcanbuf=readcanbuf):
+        """Read exactly ``size`` bytes from ``fd`` into ``bufv``.
+
+        Yields (suspending the coroutine) whenever the fd is not ready,
+        and raises once the requested amount has been received or the
+        peer closes the connection.
+        """
+        read = 0
+        while read < size:
+            try:
+                n = __read__(
+                    fd, bufv[read:] if readcanbuf else bufv, size - read,
+                )
+            except OSError as exc:
+                if exc.errno not in UNAVAIL:
+                    raise
+                yield
+                continue
+            if n == 0:
+                raise (OSError('End of file during message') if read
+                       else EOFError())
+            read += n
+
     def _recv_message(self, add_reader, fd, callback,
-                      __read__=__read__, readcanbuf=readcanbuf,
-                      BytesIO=BytesIO, unpack_from=unpack_from,
-                      load=_pickle.load):
-        Hr = Br = 0
-        if readcanbuf:
-            buf = bytearray(4)
-            bufv = memoryview(buf)
-        else:
-            buf = bufv = BytesIO()
+                      unpack_from=unpack_from, BytesIO=BytesIO,
+                      readcanbuf=readcanbuf, load=_pickle.load):
         # header
+        header_buf, header_bufv = self._new_message_buffer(4)
+        yield from self._read_into(fd, header_bufv, 4)
 
-        while Hr < 4:
-            try:
-                n = __read__(
-                    fd, bufv[Hr:] if readcanbuf else bufv, 4 - Hr,
-                )
-            except OSError as exc:
-                if exc.errno not in UNAVAIL:
-                    raise
-                yield
-            else:
-                if n == 0:
-                    raise (OSError('End of file during message') if Hr
-                           else EOFError())
-                Hr += n
+        body_size, = unpack_from('>i', header_bufv)
+        body_buf, body_bufv = self._new_message_buffer(body_size)
+        yield from self._read_into(fd, body_bufv, body_size)
 
-        body_size, = unpack_from('>i', bufv)
-        if readcanbuf:
-            buf = bytearray(body_size)
-            bufv = memoryview(buf)
-        else:
-            buf = bufv = BytesIO()
-
-        while Br < body_size:
-            try:
-                n = __read__(
-                    fd, bufv[Br:] if readcanbuf else bufv, body_size - Br,
-                )
-            except OSError as exc:
-                if exc.errno not in UNAVAIL:
-                    raise
-                yield
-            else:
-                if n == 0:
-                    raise (OSError('End of file during message') if Br
-                           else EOFError())
-                Br += n
         add_reader(fd, self.handle_event, fd)
         if readcanbuf:
-            message = load(BytesIO(bufv))
+            message = load(BytesIO(body_bufv))
         else:
-            bufv.seek(0)
-            message = load(bufv)
+            body_bufv.seek(0)
+            message = load(body_bufv)
         if message:
             callback(message)
 
